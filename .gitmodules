@@ -1,0 +1,6 @@
+[submodule "firmware-ethernet"]
+	path = firmware-ethernet
+	url = https://github.com/RPeschke/firmware-ethernet.git
+[submodule "SCROD_ETHERNET_Example_SendBack"]
+	path = SCROD_ETHERNET_Example_SendBack
+	url = https://github.com/RPeschke/SCROD_ETHERNET_Example_SendBack.git
