@@ -72,3 +72,8 @@ _ngo/
 _xmsgs/
 
 # End of https://www.gitignore.io/api/xilinxise
+
+/make_implementation.sh
+/make_simulation.sh
+/run_simulation.sh
+/run_test_cases.sh
