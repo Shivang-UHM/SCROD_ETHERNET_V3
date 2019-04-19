@@ -255,7 +255,7 @@ begin
    --------------------------
    -- Instantiate the tile --
    --------------------------
-   U_GtpS6Tile : entity work.GtpS6Tile
+   U_GtpS6Tile : entity ETHERNET.GtpS6Tile
       generic map (
          -- Simulation attributes
          TILE_SIM_GTPRESET_SPEEDUP => 0, -- Set to 1 to speed up sim reset

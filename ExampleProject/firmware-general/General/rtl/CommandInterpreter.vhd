@@ -15,6 +15,8 @@ use ieee.std_logic_1164.all;
 use ieee.std_logic_arith.all;
 use ieee.std_logic_unsigned.all;
 use work.UtilityPkg.all;
+use work.Eth1000BaseXPkg.all;
+use work.GigabitEthPkg.all;
 
 entity CommandInterpreter is 
    generic (
@@ -26,6 +28,7 @@ entity CommandInterpreter is
    port ( 
       -- User clock and reset
       usrClk      : in  sl;
+		dataClk	   : in  sl;
       usrRst      : in  sl := '0';
       -- Incoming data
       rxData      : in  slv(31 downto 0);
@@ -39,6 +42,15 @@ entity CommandInterpreter is
       txDataReady : in  sl;
       -- This board ID
       myId        : in  slv(15 downto 0);
+		--DC Comm signals
+		--WILL ADD: QB_rst
+		serialClkLck : in sl;
+		trigLinkSync : in sl;
+		DC_CMD 		 : out slv(31 downto 0);
+		QB_WrEn      : out sl;
+		QB_RdEn      : out sl;
+		DC_RESP		 : in slv(31 downto 0);
+		DC_RESP_VALID: in sl;
       -- Register interfaces
       regAddr     : out slv(REG_ADDR_BITS_G-1 downto 0);
       regWrData   : out slv(REG_DATA_BITS_G-1 downto 0);
@@ -60,6 +72,7 @@ architecture rtl of CommandInterpreter is
                           ERR_RESPONSE_S,
                           CHECK_MORE_S,PACKET_CHECKSUM_S,DUMP_S);
    
+		
    type RegType is record
       state       : StateType;
       regAddr     : slv(REG_ADDR_BITS_G-1 downto 0);
@@ -75,6 +88,8 @@ architecture rtl of CommandInterpreter is
       wordsLeft   : slv(31 downto 0);
       wordOutCnt  : slv( 7 downto 0);
       checksum    : slv(31 downto 0);
+		deviceID 	: slv(31 downto 0);
+		commandType : slv(31 downto 0);
       command     : slv(31 downto 0);
       commandId   : slv(23 downto 0);
       noResponse  : sl;
@@ -97,6 +112,8 @@ architecture rtl of CommandInterpreter is
       wordsLeft   => (others => '0'),
       wordOutCnt  => (others => '0'),
       checksum    => (others => '0'),
+		deviceID    => (others => '0'),
+		commandType => (others => '0'),
       command     => (others => '0'),
       commandId   => (others => '0'),
       noResponse  => '0',
@@ -106,7 +123,9 @@ architecture rtl of CommandInterpreter is
    
    signal r   : RegType := REG_INIT_C;
    signal rin : RegType;
-
+	signal loadQB : sl := '0';
+	signal QB_loadReg : Word32Array(1 downto 0);
+	signal start_load : sl := '0';
    -- ISE attributes to keep signals for debugging
    -- attribute keep : string;
    -- attribute keep of r : signal is "true";
@@ -132,11 +151,11 @@ architecture rtl of CommandInterpreter is
    constant ERR_BIT_COMM_CS_C : slv(31 downto 0) := x"00000010";
    constant ERR_BIT_CS_C      : slv(31 downto 0) := x"00000020";
    constant ERR_BIT_TIMEOUT_C : slv(31 downto 0) := x"00000040";
+	constant QBLINK_FAILURE_C  : slv(31 downto 0) := x"00000500"; --link not up yet error
    
-   signal wordScrodRevC      : slv(31 downto 0) := X"00A20000";
-   
+	constant wordDC				: slv(15 downto 0) := x"00DC"; --High Bytes signify a DC
+   signal wordScrodRevC      : slv(31 downto 0)  := x"00A20000";
    signal stateNum : slv(4 downto 0);
-
    -- attribute keep : string;
    -- attribute keep of stateNum : signal is "true";
 
@@ -167,7 +186,7 @@ begin
 
    wordScrodRevC(31 downto 0) <= x"00A2" & myId;
 
-   comb : process(r,usrRst,rxData,rxDataValid,rxDataLast,
+   SCRODRegComb : process(r,usrRst,rxData,rxDataValid,rxDataLast,
                   txDataReady,regRdData,regAck,wordScrodRevC) is
       variable v : RegType;
    begin
@@ -231,6 +250,7 @@ begin
                end if;
             end if;
          when COMMAND_TARGET_S => 
+			   v.deviceID := rxData;
             if rxDataValid = '1' then
                rxDataReady <= '1';
                v.wordsLeft := r.wordsLeft - 1;
@@ -239,13 +259,20 @@ begin
                if rxDataLast = '1' then
                   v.errFlags := r.errFlags + ERR_BIT_SIZE_C; 
                   v.state    := ERR_RESPONSE_S;
-               -- Target doesn't match this SCROD or broadcast
+						
+               -- Target doesn't match this SCROD or broadcast or DC
                elsif rxData /= wordScrodRevC and 
-                     rxData /= x"00000000" then
+                     rxData /= x"00000000" and
+							rxData(31 downto 16) /= wordDC then
                   v.errFlags := r.errFlags + ERR_BIT_DEST_C;
                   v.state    := ERR_RESPONSE_S;
                -- Otherwise, move on
                else
+						if rxData = wordScrodRevC  then 
+							loadQB <= '0';
+						else 
+							loadQB <= '1';
+						end if;
                   v.state := COMMAND_ID_S;
                end if;
             end if;
@@ -271,9 +298,9 @@ begin
             end if;
          when COMMAND_TYPE_S => 
             if rxDataValid = '1' then
-               rxDataReady <= '1';
+               rxDataReady <= '1'; 
                v.checksum  := r.checksum + rxData;
-               v.command   := rxData;
+               v.commandType   := rxData;
                v.wordsLeft := r.wordsLeft - 1;
                -- Possible errors:
                -- This is last, go back to IDLE
@@ -294,6 +321,7 @@ begin
          when COMMAND_DATA_S => 
             if rxDataValid = '1' then
                rxDataReady <= '1';
+					v.command   := rxData;
                v.checksum  := r.checksum + rxData;
                v.regAddr   := rxData(15 downto 0);
                v.regWrData := rxData(31 downto 16);
@@ -322,11 +350,11 @@ begin
                   v.errFlags := r.errFlags + ERR_BIT_COMM_CS_C; 
                   v.state    := ERR_RESPONSE_S;
                -- Command accepted, move to execute state
-               elsif r.command = WORD_PING_C then
+               elsif r.commandType = WORD_PING_C then
                   v.state := PING_S;
-               elsif r.command = WORD_WRITE_C then
+               elsif r.commandType = WORD_WRITE_C then
                   v.state := WRITE_S;
-               elsif r.command = WORD_READ_C then
+               elsif r.commandType = WORD_READ_C then
                   v.state := READ_S;
                -- Unrecognized command
                else
@@ -338,31 +366,73 @@ begin
             if r.noResponse = '1' then
                v.state := CHECK_MORE_S;
             else
-               v.checksum := (others => '0');
-               v.state    := PING_RESPONSE_S;
+					if loadQB = '1' then
+						if serialClkLck = '1' and trigLinkSync = '1' then --check if QBLink is up 
+								v.checksum := (others => '0');
+								v.state    := PING_RESPONSE_S;
+						 else
+							v.errFlags := r.errFlags + QBLINK_FAILURE_C;
+							v.state := ERR_RESPONSE_S;
+						 end if;
+					 else
+						v.checksum := (others => '0');
+						v.state    := PING_RESPONSE_S;
+					end if;
             end if;            
          when READ_S => 
-            v.regOp      := '0';
-            v.regReq     := '1';
-            v.timeoutCnt := r.timeoutCnt + 1;
-            if (regAck = '1') then
-               v.regRdData := regRdData;
-               v.regReq    := '0';
-               if r.noResponse = '1' then
-                  v.state := CHECK_MORE_S;
-               else
-                  v.checksum := (others => '0');
-                  v.state    := READ_RESPONSE_S;
-               end if;
-            elsif r.timeoutCnt = TIMEOUT_G then
-               v.errFlags := r.errFlags + ERR_BIT_TIMEOUT_C;
-               v.state    := ERR_RESPONSE_S;
+           
+			  if loadQB = '1' then -- if reading DC, listen to QBLink
+					QB_RdEn <= '1';
+					if DC_RESP_VALID = '1' then --wait for DC to send register data
+						v.regRdData := DC_RESP(31 downto 16);
+						if r.noResponse = '1' then --if noResponse setting on, skip response to PC
+							v.state := CHECK_MORE_S;
+						else --if noResponse setting off, send Register data in response to PC
+							v.checksum := (others => '0'); 
+							v.state    := READ_RESPONSE_S;
+						end if;
+					elsif r.timeoutCnt = TIMEOUT_G then -- if QBLink does output a word before timeout, send error to PC
+						v.errFlags := r.errFlags + ERR_BIT_TIMEOUT_C;
+						v.state    := ERR_RESPONSE_S;
+					end if;
+			   ----------------------------------------------------		
+            else  --if reading SCROD register: 
+					v.regOp      := '0'; -- set Registers to read mode
+					v.regReq     := '1'; --request operation
+					v.timeoutCnt := r.timeoutCnt + 1;
+					if (regAck = '1') then 
+						v.regRdData := regRdData;
+						v.regReq    := '0';
+						if r.noResponse = '1' then
+							v.state := CHECK_MORE_S;
+						else
+							v.checksum := (others => '0');
+							v.state    := READ_RESPONSE_S;
+						end if;
+					elsif r.timeoutCnt = TIMEOUT_G then -- if SCROD register has not acknowledged before timeout, send error to PC
+						v.errFlags := r.errFlags + ERR_BIT_TIMEOUT_C;
+						v.state    := ERR_RESPONSE_S;
+					end if;
             end if;
-         when WRITE_S => 
-            v.regOp      := '1';
-            v.regReq     := '1';
+         when WRITE_S => --TEMP allow cmd interpreter to write to both SCROD and DC registers simulataneously to test dual functionality
+            v.regOp      := '1'; --enable write to SCROD Register
+            v.regReq     := '1'; --start writing
             v.timeoutCnt := r.timeoutCnt + 1;
-            if (regAck = '1') then
+				if loadQB = '1' then --if writing to DC: wait for them to repeat correct address
+					QB_RdEn <= '1';
+					if DC_RESP(15 downto 0) = r.regAddr then --write operation is successful if DC repeats address, even if simultaneous SCROD register operation fails. 
+						if r.noResponse = '1' then --skip response to PC if noResponse setting is on
+							v.state := CHECK_MORE_S;
+						else
+							v.checksum := (others => '0');
+							v.state    := WRITE_RESPONSE_S;
+						end if;
+					elsif r.timeoutCnt = TIMEOUT_G then --if the DC does not repeat register before timeout, error is raised (even if SCROD register is written successfully).
+						v.errFlags := r.errFlags + ERR_BIT_TIMEOUT_C;
+						v.state    := ERR_RESPONSE_S;
+					end if;
+				-----------------------------
+				elsif (regAck = '1') then --if not reading DC, make sure SCROD register write was successful.
                v.regReq    := '0';
                if r.noResponse = '1' then
                   v.state := CHECK_MORE_S;
@@ -370,18 +440,20 @@ begin
                   v.checksum := (others => '0');
                   v.state    := WRITE_RESPONSE_S;
                end if;
-            elsif r.timeoutCnt = TIMEOUT_G then
-               v.errFlags := r.errFlags + ERR_BIT_TIMEOUT_C;
-               v.state    := ERR_RESPONSE_S;
+					
+				elsif r.timeoutCnt = TIMEOUT_G then
+						v.errFlags := r.errFlags + ERR_BIT_TIMEOUT_C;
+						v.state    := ERR_RESPONSE_S;
             end if;
          when READ_RESPONSE_S => 
+				QB_RdEn <= '0';
             if regAck = '0' and r.regReq = '0' then
                v.txDataValid := '1';
                case conv_integer(r.wordOutCnt) is
                   when 0 => v.txData := WORD_HEADER_C;
                   when 1 => v.txData := x"00000006";
                   when 2 => v.txData := WORD_ACK_C;
-                  when 3 => v.txData := wordScrodRevC;
+                  when 3 => v.txData := r.deviceID;
                   when 4 => v.txData := x"00" & r.commandId;
                   when 5 => v.txData := WORD_READ_C;
                   when 6 => v.txData := r.regRdData & r.regAddr;
@@ -395,14 +467,16 @@ begin
                   v.wordOutCnt := r.wordOutCnt + 1;
                end if;
             end if;
-         when WRITE_RESPONSE_S => 
+				  
+         when WRITE_RESPONSE_S =>   
+				QB_RdEn <= '0';
             if regAck = '0' and r.regReq = '0' then
                v.txDataValid := '1';
                case conv_integer(r.wordOutCnt) is
                   when 0 => v.txData := WORD_HEADER_C;
                   when 1 => v.txData := x"00000006";
                   when 2 => v.txData := WORD_ACK_C;
-                  when 3 => v.txData := wordScrodRevC;
+                  when 3 => v.txData := r.deviceID;
                   when 4 => v.txData := x"00" & r.commandId;
                   when 5 => v.txData := WORD_WRITE_C;
                   when 6 => v.txData := r.regWrData & r.regAddr;
@@ -422,7 +496,7 @@ begin
                when 0 => v.txData := WORD_HEADER_C;
                when 1 => v.txData := x"00000005";
                when 2 => v.txData := WORD_ACK_C;
-               when 3 => v.txData := wordScrodRevC;
+               when 3 => v.txData := r.deviceID;
                when 4 => v.txData := x"00" & r.commandId;
                when 5 => v.txData := WORD_PING_C;
                when 6 => v.txData     := v.checksum;
@@ -453,6 +527,7 @@ begin
                when others => v.txData := (others => '1');
             end case;
          when CHECK_MORE_S =>
+				loadQB <= '0';
             if r.wordsLeft /= 1 then
                v.state := COMMAND_ID_S;
             else
@@ -474,7 +549,7 @@ begin
       if (usrRst = '1') then
          v := REG_INIT_C;
       end if;
-
+	
       -- Outputs to ports
       txData      <= r.txData;
       txDataValid <= r.txDataValid;
@@ -484,18 +559,37 @@ begin
       regWrData   <= r.regWrData;
       regReq      <= r.regReq;
       regOp       <= r.regOp;
-      
+      DC_CMD      <= QB_loadReg(1);
       -- Assignment of combinatorial variable to signal
       rin <= v;
 
    end process;
-
+	
    seq : process (usrClk) is
    begin
       if (rising_edge(usrClk)) then
          r <= rin after GATE_DELAY_G;
+			if r.state = COMMAND_DATA_S and loadQB = '1' then
+				QB_loadReg(0) <= r.commandType;
+				start_load <= '1';
+			elsif r.state = COMMAND_CHECKSUM_S and loadQB = '1' then
+				QB_loadReg(0) <= r.command;
+				start_load <= '1';
+			elsif r.state = CHECK_MORE_S or r.state = ERR_RESPONSE_S then	
+				start_load <= '0';
+			end if;
       end if;
-   end process seq;
+   end process;
+	
+	QBload_reg : process (dataClk, start_load) is 
+	begin 
+		if start_load = '1' then
+			QB_WrEn <= '1';
+			  QB_loadReg(1) <= QB_loadReg(0);
+		else
+			QB_WrEn <= '0';
+		end if;
+  end process;
 
 end rtl;
 
