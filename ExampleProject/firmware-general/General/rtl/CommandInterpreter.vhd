@@ -44,7 +44,7 @@ entity CommandInterpreter is
 		--DC Comm signals
 		serialClkLck : in slv(num_DC downto 0);
 		trigLinkSync : in slv(num_DC downto 0);
-		DC_CMD 		 : out slv(31 downto 0);
+		DC_CMD 		 : out slv(31 downto 0) := (others => '0');
 		QB_WrEn      : out slv(num_DC downto 0);
 		QB_RdEn      : out slv(num_DC downto 0);
 		DC_RESP		 : in slv(31 downto 0);
@@ -716,6 +716,12 @@ begin
 					g.txDataValid := '1';
 					g.txData := DC_RESP;
 					g.state := SENDTRIG_S;
+					if conv_integer(unsigned(g.wordOutCnt)) = num_DC then
+						g.txdatalast := '1';
+					else
+						g.txdatalast := '0';
+					end if;
+					
 				elsif conv_integer(unsigned(g.wordOutCnt)) > num_DC THEN
 					g.wordOutCnt := (others => '0');
 					g.txDataValid := '0';
